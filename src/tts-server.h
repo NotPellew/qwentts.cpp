@@ -21,6 +21,10 @@
 // Audio out: response_format "pcm" streams s16le 24 kHz mono chunked as it
 // is generated (real time), "wav" returns a one-shot RIFF file. pcm is the
 // default so streaming is on unless the client asks for a file.
+//
+// The streaming route aborts generation when the client disconnects: the
+// request socket is peeked from inside the generation loop, so the abort
+// lands at the next decode step instead of after the send buffer drains.
 
 #include "../vendor/cpp-httplib/httplib.h"
 #include "audio-io.h"
@@ -83,15 +87,22 @@ struct tts_voice_upload {
 // on_chunk and stops generation.
 using tts_sink = std::function<bool(const float * samples, int n_samples)>;
 
+// Reports whether the client is still there. The shared layer hands one to
+// every streaming request; the adapter wires it into the ABI cancel hook, so
+// the check runs inside the generation loop. Empty means never abort.
+using tts_abort = std::function<bool()>;
+
 // Adapter implemented by each project tool.
 struct tts_backend {
     std::string              model_id;  // reported by GET /v1/models
     std::vector<std::string> voices;    // reported by GET /v1/audio/voices, may be empty
     // Run synthesis. When the request streams, the adapter routes the ABI
-    // on_chunk to sink ; otherwise it pushes the whole buffer once. Returns
-    // the ABI status (0 on success), and fills err with the ABI message on
-    // failure. The shared layer maps the status to an HTTP code.
-    std::function<int(const tts_request & req, const tts_sink & sink, std::string & err)> synthesize;
+    // on_chunk to sink ; otherwise it pushes the whole buffer once. abort is
+    // polled by the ABI while the request streams and empty on buffered runs.
+    // Returns the ABI status (0 on success), and fills err with the ABI message
+    // on failure. The shared layer maps the status to an HTTP code.
+    std::function<int(const tts_request & req, const tts_sink & sink, const tts_abort & abort, std::string & err)>
+        synthesize;
     // Voice registry hooks, all optional: a null hook answers 501 on the
     // matching route. register_voice stores or replaces a cloned voice,
     // remove_voice drops one (false when absent), registered_voices lists
@@ -297,7 +308,7 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
             return true;
         };
         std::string synth_err;
-        int         rc = be.synthesize(req, sink, synth_err);
+        int         rc = be.synthesize(req, sink, tts_abort(), synth_err);
         if (rc != 0) {
             tts_json_error(res, tts_status_to_http(rc), "server_error",
                            synth_err.empty() ? "synthesis failed" : synth_err.c_str());
@@ -335,9 +346,24 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
 
     auto st = std::make_shared<stream_state>();
 
-    st->th = std::thread([&be, req, st]() {
-        tts_sink push = [st](const float * s, int n) {
-            if (st->client_gone.load(std::memory_order_acquire)) {
+    // Copied out of the request: httplib measures liveness with a zero
+    // timeout poll plus a peeked read, so it reports a peer that closed
+    // (FIN or RST) while writes into the send buffer still succeed.
+    auto closed     = std::make_shared<std::function<bool()>>(http_req.is_connection_closed);
+    tts_abort abort = [st, closed]() -> bool {
+        if (st->client_gone.load(std::memory_order_acquire)) {
+            return true;
+        }
+        if (!(*closed)()) {
+            return false;
+        }
+        st->client_gone.store(true, std::memory_order_release);
+        return true;
+    };
+
+    st->th = std::thread([&be, req, st, abort]() {
+        tts_sink push = [st, abort](const float * s, int n) {
+            if (abort()) {
                 return false;
             }
             std::string bytes;
@@ -348,7 +374,7 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
             return true;
         };
         std::string                 synth_err;
-        int                         rc = be.synthesize(req, push, synth_err);
+        int                         rc = be.synthesize(req, push, abort, synth_err);
         std::lock_guard<std::mutex> lk(st->mu);
         st->rc   = rc;
         st->err  = synth_err;

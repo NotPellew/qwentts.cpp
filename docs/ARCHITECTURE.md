@@ -670,6 +670,14 @@ DELETE /v1/audio/voices/{name}  drop a registered voice
 GET    /health                  liveness probe
 ```
 
+The streaming route aborts generation when the client goes away: the
+handler copies httplib's `is_connection_closed` probe (a zero-timeout poll
+plus a peeked read) into the request and the adapter polls it from the ABI
+cancel hook, so a disconnect stops the decode loop at its next step instead
+of after the kernel send buffer drains. The next request waits on the
+adapter's synthesis gate until the cancelled worker has returned from
+`qt_synthesize`.
+
 A registered voice wins over a model speaker of the same name and
 injects the reference latents into `qt_tts_params` : `ref_text` present
 selects ICL clone mode, absent selects the x-vector-only mode. The
