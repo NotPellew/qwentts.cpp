@@ -57,21 +57,21 @@ struct tts_request {
     std::string lang;          // language label, empty keeps the server default
     std::string voice;         // OAI voice, mapped to a speaker by the adapter
     std::string instructions;  // OAI instructions, mapped to the ABI instruct field
-    std::string format;        // "pcm" (stream) or "wav" (one-shot)
-    float       speed;         // OAI speed, parsed then ignored (no time stretch in the ABI)
+    std::string format = "pcm";  // "pcm" (stream) or "wav" (one-shot)
+    float       speed  = 1.0f;   // OAI speed, parsed then ignored (no time stretch in the ABI)
 
     // Optional sampling overrides, one set per stack. -1 (ints) and NaN
     // (floats) mark a field the client left unset, keeping the engine
-    // defaults.
-    int64_t seed;                   // forwarded verbatim, -1 draws a random seed
-    int     max_new_tokens;         // strictly positive
-    int     top_k;                  // 0 disables the top-k filter
-    float   temperature;            // 0 selects greedy decoding
-    float   top_p;                  // in (0, 1]
-    float   repetition_penalty;     // strictly positive
-    int     subtalker_top_k;        // 0 disables the top-k filter
-    float   subtalker_temperature;  // 0 selects greedy decoding
-    float   subtalker_top_p;        // in (0, 1]
+    // defaults, which is also what a default constructed request carries.
+    int64_t seed                  = -1;   // forwarded verbatim, -1 draws a random seed
+    int     max_new_tokens        = -1;   // strictly positive
+    int     top_k                 = -1;   // 0 disables the top-k filter
+    float   temperature           = NAN;  // 0 selects greedy decoding
+    float   top_p                 = NAN;  // in (0, 1]
+    float   repetition_penalty    = NAN;  // strictly positive
+    int     subtalker_top_k       = -1;   // 0 disables the top-k filter
+    float   subtalker_temperature = NAN;  // 0 selects greedy decoding
+    float   subtalker_top_p       = NAN;  // in (0, 1]
 };
 
 // One voice registration parsed from the POST /v1/audio/voices JSON body.
@@ -228,18 +228,8 @@ static bool tts_parse_request(const std::string & body, tts_request & req, std::
     yyjson_val * speed = yyjson_obj_get(root, "speed");
     req.speed          = yyjson_is_num(speed) ? (float) yyjson_get_num(speed) : 1.0f;
 
-    // Optional sampling overrides. A missing field keeps its unset
-    // marker; a present field must be well typed and in domain.
-    req.seed                  = -1;
-    req.max_new_tokens        = -1;
-    req.top_k                 = -1;
-    req.temperature           = NAN;
-    req.top_p                 = NAN;
-    req.repetition_penalty    = NAN;
-    req.subtalker_top_k       = -1;
-    req.subtalker_temperature = NAN;
-    req.subtalker_top_p       = NAN;
-
+    // Optional sampling overrides. A missing field leaves the request's
+    // unset marker; a present field must be well typed and in domain.
     auto opt_int = [&](const char * key, int64_t lo, int64_t hi, int64_t & out) -> bool {
         yyjson_val * v = yyjson_obj_get(root, key);
         if (!v) {

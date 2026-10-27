@@ -12,6 +12,7 @@
 #include "rvq-file.h"
 #include "version.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -59,7 +60,11 @@ static void print_usage(const char * prog) {
             "  --max-batch <n>         Concurrent requests batched on the GPU (default: 1)\n"
             "  --no-fa                 Disable flash attention\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
-            "  --codec-chunk-dur <f>   Codec decode chunk duration in seconds, wav responses (default: 24.0)\n",
+            "  --codec-chunk-dur <f>   Codec decode chunk duration in seconds, wav responses (default: 24.0)\n"
+            "  --voice-name <name>     Register this cloned voice at startup\n"
+            "  --voice-wav <path>      Reference WAV for --voice-name, extracted once here\n"
+            "  --voice-text <path>     Reference transcript enabling ICL clone mode\n"
+            "                          The registered voice is warmed before the port opens.\n",
             prog);
 }
 
@@ -68,6 +73,52 @@ static std::string basename_of(const char * path) {
     std::string s = path;
     size_t      p = s.find_last_of("/\\");
     return p == std::string::npos ? s : s.substr(p + 1);
+}
+
+// Read a whole file as bytes.
+static bool read_file(const std::string & path, std::string & out) {
+    size_t    size = 0;
+    uint8_t * raw  = audio_io_load_file(path.c_str(), &size);
+    if (!raw) {
+        return false;
+    }
+    out.assign((const char *) raw, size);
+    free(raw);
+    return true;
+}
+
+// Strip the whitespace a text file carries at its edges: a reference
+// transcript is fed to the prompt verbatim, so a trailing newline would
+// change its tokens.
+static void trim_ascii(std::string & s) {
+    const char * ws = " \t\r\n";
+    size_t       b  = s.find_first_not_of(ws);
+    size_t       e  = s.find_last_not_of(ws);
+    s               = b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+}
+
+// Turn WAV bytes into voice latents: the speaker encoder and the codec
+// encoder run once here, at startup or at registration, never on a request's
+// timing path.
+static bool voice_ref_from_wav(struct qt_context * q,
+                               const std::string & wav,
+                               const std::string & ref_text,
+                               voice_entry &       entry,
+                               std::string &       err) {
+    int     T   = 0;
+    float * pcm = audio_read_mono_buf((const uint8_t *) wav.data(), wav.size(), 24000, &T);
+    if (!pcm) {
+        err = "cannot decode the WAV payload";
+        return false;
+    }
+    enum qt_status rc = qt_extract_voice_ref(q, pcm, T, &entry.ref);
+    free(pcm);
+    if (rc != QT_STATUS_OK) {
+        err = qt_last_error();
+        return false;
+    }
+    entry.ref_text = ref_text;
+    return true;
 }
 
 // One synthesis at a time at the default batch width. The ABI serializes its
@@ -95,6 +146,9 @@ int main(int argc, char ** argv) {
     // Chunk sentinel : qt_init resolves a non positive value to the
     // library default.
     float         codec_chunk_dur = 0.0f;
+    std::string   voice_name;
+    std::string   voice_wav;
+    std::string   voice_text;
 
     for (int i = 1; i < argc; i++) {
         const char * arg = argv[i];
@@ -120,6 +174,12 @@ int main(int argc, char ** argv) {
             max_batch = std::atoi(argv[++i]);
         } else if (!std::strcmp(arg, "--codec-chunk-dur") && i + 1 < argc) {
             codec_chunk_dur = (float) std::atof(argv[++i]);
+        } else if (!std::strcmp(arg, "--voice-name") && i + 1 < argc) {
+            voice_name = argv[++i];
+        } else if (!std::strcmp(arg, "--voice-wav") && i + 1 < argc) {
+            voice_wav = argv[++i];
+        } else if (!std::strcmp(arg, "--voice-text") && i + 1 < argc) {
+            voice_text = argv[++i];
         } else {
             print_usage(argv[0]);
             return 1;
@@ -128,6 +188,10 @@ int main(int argc, char ** argv) {
 
     if (!talker_path || !codec_path) {
         print_usage(argv[0]);
+        return 1;
+    }
+    if (voice_wav.empty() != voice_name.empty()) {
+        fprintf(stderr, "[Server] FATAL: --voice-name and --voice-wav go together\n");
         return 1;
     }
     if (device && !backend_check_device(device)) {
@@ -171,23 +235,14 @@ int main(int argc, char ** argv) {
         }
 
         voice_entry entry;
-        entry.ref      = {};
-        entry.ref_text = up.ref_text;
+        entry.ref = {};
 
         if (!up.wav.empty()) {
-            int     T   = 0;
-            float * pcm = audio_read_mono_buf((const uint8_t *) up.wav.data(), up.wav.size(), 24000, &T);
-            if (!pcm) {
-                err = "cannot decode the WAV payload";
-                return false;
-            }
-            enum qt_status rc = qt_extract_voice_ref(q, pcm, T, &entry.ref);
-            free(pcm);
-            if (rc != QT_STATUS_OK) {
-                err = qt_last_error();
+            if (!voice_ref_from_wav(q, up.wav, up.ref_text, entry, err)) {
                 return false;
             }
         } else {
+            entry.ref_text = up.ref_text;
             if (up.spk.size() % sizeof(float) != 0 || up.spk.empty()) {
                 err = "'spk_b64' must decode to a positive multiple of 4 bytes";
                 return false;
@@ -364,6 +419,46 @@ int main(int argc, char ** argv) {
         }
         return 0;
     };
+
+    // Startup clone: extract the reference once, then warm the engine with
+    // the registered voice. The first user request then finds the CUDA
+    // graphs, the kernels and the codec's ICL reference snapshot already
+    // resident instead of paying them inside its own latency.
+    if (!voice_name.empty()) {
+        std::string wav_bytes;
+        if (!read_file(voice_wav, wav_bytes)) {
+            fprintf(stderr, "[Server] FATAL: cannot read %s\n", voice_wav.c_str());
+            return 1;
+        }
+        tts_voice_upload up;
+        up.name = voice_name;
+        up.wav  = std::move(wav_bytes);
+        if (!voice_text.empty() && !read_file(voice_text, up.ref_text)) {
+            fprintf(stderr, "[Server] FATAL: cannot read %s\n", voice_text.c_str());
+            return 1;
+        }
+        trim_ascii(up.ref_text);
+        std::string reg_err;
+        if (!be.register_voice(up, reg_err)) {
+            fprintf(stderr, "[Server] FATAL: cannot register voice '%s': %s\n", voice_name.c_str(), reg_err.c_str());
+            return 1;
+        }
+
+        tts_request wreq;
+        wreq.input = "Hi.";
+        wreq.voice = voice_name;
+        tts_sink    discard = [](const float *, int) { return true; };
+        std::string warm_err;
+        const auto  warm_t0 = std::chrono::steady_clock::now();
+        const int   warm_rc = be.synthesize(wreq, discard, tts_abort(), warm_err);
+        const double warm_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - warm_t0).count();
+        if (warm_rc != 0) {
+            fprintf(stderr, "[Server] warm failed (%s), the first request pays it\n", warm_err.c_str());
+        } else {
+            qt_log(QT_LOG_INFO, "[Server] warm: voice '%s' %.0f ms", voice_name.c_str(), warm_ms);
+        }
+    }
 
     int rc = tts_server_run(be, cfg);
     qt_free(q);

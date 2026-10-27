@@ -641,6 +641,10 @@ Optional:
   --no-fa                 Disable flash attention
   --clamp-fp16            Clamp hidden states to FP16 range
   --codec-chunk-dur <f>   Codec decode chunk duration in seconds, wav responses (default: 24.0)
+  --voice-name <name>     Register this cloned voice at startup
+  --voice-wav <path>      Reference WAV for --voice-name, extracted once here
+  --voice-text <path>     Reference transcript enabling ICL clone mode
+                          The registered voice is warmed before the port opens.
 ```
 
 Endpoints :
@@ -693,7 +697,10 @@ injects the reference latents into `qt_tts_params` : `ref_text` present
 selects ICL clone mode, absent selects the x-vector-only mode. The
 registry lives in process RAM and every access shares the synthesis
 mutex, so registration (which runs the extraction on the GPU) and
-lookups never race a running synthesis.
+lookups never race a running synthesis. `--voice-name` with `--voice-wav`
+registers that clone before the port opens and synthesizes one short
+utterance with it, which pays CUDA graph capture, kernel autotune and the
+codec's ICL reference snapshot outside the first user request.
 
 ## Module map
 
