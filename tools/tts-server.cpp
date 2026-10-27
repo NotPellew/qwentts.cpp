@@ -2,7 +2,8 @@
 // ABI. Loads a talker + codec once, GPU resident, and serves synthesis over
 // POST /v1/audio/speech. The shared core lives in src/tts-server.h ; this
 // file only wires the qt_* ABI into the generic adapter, including the
-// cancel hook that a client disconnect trips.
+// cancel hook that a client disconnect trips and the framed
+// /v1/audio/speech/pcm-stream route.
 
 #include "tts-server.h"
 

@@ -9,6 +9,10 @@
 //
 // Endpoints:
 //   POST   /v1/audio/speech         OAI text-to-speech
+//   POST   /v1/audio/speech/pcm-stream
+//                                   framed PCM stream: [u32 big endian byte
+//                                   length][s16le 24 kHz mono], a zero-length
+//                                   frame ends a successful stream
 //   GET    /v1/models               single loaded model
 //   GET    /v1/audio/voices         model speakers plus registered cloned voices
 //   POST   /v1/audio/voices         register a cloned voice: {name, ref_text,
@@ -144,6 +148,17 @@ static void tts_append_s16le(std::string & out, const float * samples, int n_sam
         *p++      = (char) ((uint16_t) s & 0xff);
         *p++      = (char) (((uint16_t) s >> 8) & 0xff);
     }
+}
+
+// Append one block as a length prefixed PCM frame, the wire format the
+// Qwen3-TTS client parses: [u32 big endian byte length][s16le samples].
+static void tts_append_frame(std::string & out, const float * samples, int n_samples) {
+    const uint32_t len = (uint32_t) n_samples * 2u;
+    out.push_back((char) (len >> 24));
+    out.push_back((char) (len >> 16));
+    out.push_back((char) (len >> 8));
+    out.push_back((char) len);
+    tts_append_s16le(out, samples, n_samples);
 }
 
 // Voice names are case insensitive: the registry, the synthesis lookup
@@ -288,51 +303,31 @@ static int tts_status_to_http(int rc) {
     return 502;
 }
 
-static void tts_handle_speech(const tts_backend & be, const httplib::Request & http_req, httplib::Response & res) {
-    tts_request req;
-    std::string err;
-    if (!tts_parse_request(http_req.body, req, err)) {
-        tts_json_error(res, 400, "invalid_request_error", err.c_str());
-        return;
-    }
-
-    if (req.format == "wav") {
-        // One-shot : collect the whole utterance, then emit a RIFF
-        // file. The backend call blocks this connection thread; in
-        // batch mode the chunks arrive from the ABI worker thread while
-        // this thread waits inside qt_synthesize, so the plain append
-        // stays single producer and the blocking return synchronizes.
-        std::vector<float> buf;
-        tts_sink           sink = [&buf](const float * s, int n) {
-            buf.insert(buf.end(), s, s + n);
-            return true;
-        };
-        std::string synth_err;
-        int         rc = be.synthesize(req, sink, tts_abort(), synth_err);
-        if (rc != 0) {
-            tts_json_error(res, tts_status_to_http(rc), "server_error",
-                           synth_err.empty() ? "synthesis failed" : synth_err.c_str());
-            return;
-        }
-        std::string wav = audio_encode_wav(buf.data(), (int) buf.size(), 24000, WAV_S16);
-        res.set_content(std::move(wav), "audio/wav");
-        return;
-    }
-
-    // Streaming : the synthesis runs on its own thread pushing s16le
-    // bytes into a queue; the connection thread drains the queue into
-    // the chunked sink. The decoupling keeps a slow client from
-    // stalling the ABI worker (head of line blocking across the whole
-    // batch), and a client disconnect flips client_gone so the next
-    // chunk callback aborts generation and frees the GPU instead of
-    // finishing a stream nobody reads. Backpressure is the utterance
-    // itself: pending grows at most to the full PCM of one synthesis.
+static void tts_handle_speech_stream(const tts_backend &      be,
+                                     const httplib::Request & http_req,
+                                     const tts_request &      req,
+                                     httplib::Response &      res,
+                                     bool                     framed) {
+    // Streaming : the synthesis runs on its own thread pushing PCM bytes
+    // into a queue; the connection thread drains the queue into the chunked
+    // sink. framed selects the wire contract: every emitted block becomes a
+    // [u32 big endian length][s16le] frame and a zero-length frame closes a
+    // successful stream; unframed is the bare s16le body of the OAI route,
+    // which ends at EOF.
     //
-    // The stream opens on the first chunk: a synthesis that fails
-    // before producing audio gets the JSON error envelope with the
-    // mapped status, like the wav path. A failure after the stream
-    // started closes the connection without the terminating chunk, so
-    // the client sees a transport error instead of a clean EOF.
+    // The decoupling keeps a slow client from stalling the ABI worker (head
+    // of line blocking across the whole batch), and the abort predicate
+    // peeks the request socket, so a disconnect stops the ABI at its next
+    // decode step instead of after the send buffer drains. Backpressure is
+    // the utterance itself: pending grows at most to the full PCM of one
+    // synthesis.
+    //
+    // The stream opens on the first block: a synthesis that fails before
+    // producing audio gets the JSON error envelope with the mapped status,
+    // like the wav path. A failure after the stream started, or a cancel,
+    // closes the connection without the terminating chunk, so the client
+    // sees a truncated body instead of a clean end and never mistakes a
+    // failure for a zero-length end frame.
     struct stream_state {
         std::mutex              mu;
         std::condition_variable cv;
@@ -361,13 +356,20 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
         return true;
     };
 
-    st->th = std::thread([&be, req, st, abort]() {
-        tts_sink push = [st, abort](const float * s, int n) {
+    st->th = std::thread([&be, req, st, abort, framed]() {
+        tts_sink push = [st, abort, framed](const float * s, int n) {
             if (abort()) {
                 return false;
             }
+            if (n <= 0) {
+                return true;
+            }
             std::string bytes;
-            tts_append_s16le(bytes, s, n);
+            if (framed) {
+                tts_append_frame(bytes, s, n);
+            } else {
+                tts_append_s16le(bytes, s, n);
+            }
             std::lock_guard<std::mutex> lk(st->mu);
             st->pending += bytes;
             st->cv.notify_all();
@@ -386,20 +388,30 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
         std::unique_lock<std::mutex> lk(st->mu);
         st->cv.wait(lk, [&] { return st->done || !st->pending.empty(); });
         if (st->pending.empty() && st->rc != 0) {
-            const int rc = st->rc;
-            err          = st->err;
+            const int         rc   = st->rc;
+            const bool        gone = st->client_gone.load(std::memory_order_acquire);
+            const std::string msg  = st->err;
             lk.unlock();
             st->th.join();
-            tts_json_error(res, tts_status_to_http(rc), "server_error", err.empty() ? "synthesis failed" : err.c_str());
+            if (gone) {
+                return;
+            }
+            tts_json_error(res, tts_status_to_http(rc), "server_error", msg.empty() ? "synthesis failed" : msg.c_str());
             return;
         }
     }
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
+    if (framed) {
+        res.set_header("X-TTS-Stream", "pcm");
+        res.set_header("X-TTS-Sample-Rate", "24000");
+        res.set_header("X-TTS-Channels", "1");
+        res.set_header("X-TTS-Sample-Width", "2");
+    }
     res.set_chunked_content_provider(
-        "audio/pcm",
-        [st](size_t, httplib::DataSink & sink) -> bool {
+        framed ? "application/octet-stream" : "audio/pcm",
+        [st, framed](size_t, httplib::DataSink & sink) -> bool {
             std::string chunk;
             int         rc = 0;
             {
@@ -418,6 +430,13 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
             if (rc != 0) {
                 return false;
             }
+            if (framed) {
+                const char end[4] = { 0, 0, 0, 0 };
+                if (!sink.write(end, sizeof(end))) {
+                    st->client_gone.store(true, std::memory_order_release);
+                    return false;
+                }
+            }
             sink.done();
             return true;
         },
@@ -427,6 +446,52 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
                 st->th.join();
             }
         });
+}
+
+static void tts_handle_speech(const tts_backend & be, const httplib::Request & http_req, httplib::Response & res) {
+    tts_request req;
+    std::string err;
+    if (!tts_parse_request(http_req.body, req, err)) {
+        tts_json_error(res, 400, "invalid_request_error", err.c_str());
+        return;
+    }
+
+    if (req.format != "wav") {
+        tts_handle_speech_stream(be, http_req, req, res, false);
+        return;
+    }
+
+    // One-shot : collect the whole utterance, then emit a RIFF file. The
+    // backend call blocks this connection thread; in batch mode the chunks
+    // arrive from the ABI worker thread while this thread waits inside
+    // qt_synthesize, so the plain append stays single producer and the
+    // blocking return synchronizes.
+    std::vector<float> buf;
+    tts_sink           sink = [&buf](const float * s, int n) {
+        buf.insert(buf.end(), s, s + n);
+        return true;
+    };
+    std::string synth_err;
+    int         rc = be.synthesize(req, sink, tts_abort(), synth_err);
+    if (rc != 0) {
+        tts_json_error(res, tts_status_to_http(rc), "server_error",
+                       synth_err.empty() ? "synthesis failed" : synth_err.c_str());
+        return;
+    }
+    std::string wav = audio_encode_wav(buf.data(), (int) buf.size(), 24000, WAV_S16);
+    res.set_content(std::move(wav), "audio/wav");
+}
+
+// POST /v1/audio/speech/pcm-stream: the framed contract regardless of what
+// response_format says, because the route itself names the wire format.
+static void tts_handle_pcm_stream(const tts_backend & be, const httplib::Request & http_req, httplib::Response & res) {
+    tts_request req;
+    std::string err;
+    if (!tts_parse_request(http_req.body, req, err)) {
+        tts_json_error(res, 400, "invalid_request_error", err.c_str());
+        return;
+    }
+    tts_handle_speech_stream(be, http_req, req, res, true);
 }
 
 // Decode standard base64 (with optional padding) into out. Returns
@@ -648,6 +713,8 @@ static int tts_server_run(const tts_backend & be, const server_config & cfg) {
 
     svr.Post("/v1/audio/speech",
              [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_speech(be, req, res); });
+    svr.Post("/v1/audio/speech/pcm-stream",
+             [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_pcm_stream(be, req, res); });
     svr.Get("/v1/models",
             [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_models(be, req, res); });
     svr.Get("/v1/audio/voices",
