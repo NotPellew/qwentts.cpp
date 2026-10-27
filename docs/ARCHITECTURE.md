@@ -681,7 +681,10 @@ POST   /v1/audio/voices         register a cloned voice: {name, ref_text,
                                 spk_b64, rvq_b64} takes the pre-extracted
                                 latents verbatim
 DELETE /v1/audio/voices/{name}  drop a registered voice
-GET    /health                  liveness probe
+GET    /health                  readiness: 200 carries model_ready true, the
+                                model id and the voice counts. The port opens
+                                only after the model is loaded and warmed, so
+                                a 200 means requests find the engine resident
 ```
 
 Both streaming routes cancel generation when the client goes away: the

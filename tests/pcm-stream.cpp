@@ -461,7 +461,7 @@ void test_error_mid_stream_is_truncated() {
 }
 
 void test_health() {
-    fprintf(stderr, "health liveness\n");
+    fprintf(stderr, "health readiness\n");
     exchange ex;
     check(ex.open(kPort), "connect");
     const std::string req = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
@@ -469,7 +469,10 @@ void test_health() {
     check(ex.read_headers(5000) && ex.status == 200, "200 response");
     while (ex.fill(500) > 0) {
     }
+    check(ex.buf.find("\"model_ready\":true") != std::string::npos, "reports model readiness");
     check(ex.buf.find("\"status\":\"ok\"") != std::string::npos, "reports ok");
+    check(ex.buf.find("\"model_id\":\"fake-model\"") != std::string::npos, "reports the loaded model");
+    check(ex.buf.find("\"speakers\":1") != std::string::npos, "counts the model speakers");
     ex.close_now();
 }
 

@@ -20,7 +20,8 @@
 //                                   ref_text, spk_b64, rvq_b64} takes
 //                                   pre-extracted latents verbatim
 //   DELETE /v1/audio/voices/{name}  drop a registered voice
-//   GET    /health                  liveness probe
+//   GET    /health                  readiness probe: answers 200 only once the
+//                                   model is loaded and warmed
 //
 // Audio out: response_format "pcm" streams s16le 24 kHz mono chunked as it
 // is generated (real time), "wav" returns a one-shot RIFF file. pcm is the
@@ -683,8 +684,27 @@ static void tts_handle_voices(const tts_backend & be, const httplib::Request &, 
     yyjson_mut_doc_free(doc);
 }
 
-static void tts_handle_health(const httplib::Request &, httplib::Response & res) {
-    res.set_content("{\"status\":\"ok\"}", "application/json");
+// Readiness, not just liveness: tts_server_run binds the port only after the
+// adapter loaded the model and warmed it, so a 200 here means a request will
+// find the engine resident.
+static void tts_handle_health(const tts_backend & be, const httplib::Request &, httplib::Response & res) {
+    yyjson_mut_doc * doc  = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val * root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "ok");
+    yyjson_mut_obj_add_bool(doc, root, "model_ready", true);
+    yyjson_mut_obj_add_str(doc, root, "model_id", be.model_id.c_str());
+    yyjson_mut_val * voices = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, voices, "speakers", (int64_t) be.voices.size());
+    yyjson_mut_obj_add_int(doc, voices, "registered",
+                           (int64_t) (be.registered_voices ? be.registered_voices().size() : 0));
+    yyjson_mut_obj_add_val(doc, root, "voices", voices);
+    char * json = yyjson_mut_write(doc, 0, NULL);
+    res.set_content(json ? json : "{}", "application/json");
+    if (json) {
+        free(json);
+    }
+    yyjson_mut_doc_free(doc);
 }
 
 static int tts_server_run(const tts_backend & be, const server_config & cfg) {
@@ -739,7 +759,7 @@ static int tts_server_run(const tts_backend & be, const server_config & cfg) {
              [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_voice_register(be, req, res); });
     svr.Delete(R"(/v1/audio/voices/(.+))",
                [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_voice_delete(be, req, res); });
-    svr.Get("/health", tts_handle_health);
+    svr.Get("/health", [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_health(be, req, res); });
 
     signal(SIGINT, tts_on_signal);
     signal(SIGTERM, tts_on_signal);
