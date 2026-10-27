@@ -38,6 +38,7 @@
 #include <atomic>
 #include <cctype>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
@@ -335,11 +336,20 @@ static void tts_handle_speech_stream(const tts_backend &      be,
         bool                    done = false;
         int                     rc   = 0;
         std::string             err;
+        size_t                  frames = 0;
+        const char *            label  = "speech";
+        std::string             voice;
+        size_t                  text_len = 0;
+        std::chrono::steady_clock::time_point start;
         std::atomic<bool>       client_gone{ false };
         std::thread             th;
     };
 
-    auto st = std::make_shared<stream_state>();
+    auto st      = std::make_shared<stream_state>();
+    st->label    = framed ? "pcm-stream" : "speech";
+    st->voice    = req.voice;
+    st->text_len = req.input.size();
+    st->start    = std::chrono::steady_clock::now();
 
     // Copied out of the request: httplib measures liveness with a zero
     // timeout poll plus a peeked read, so it reports a peer that closed
@@ -372,6 +382,7 @@ static void tts_handle_speech_stream(const tts_backend &      be,
             }
             std::lock_guard<std::mutex> lk(st->mu);
             st->pending += bytes;
+            st->frames++;
             st->cv.notify_all();
             return true;
         };
@@ -442,9 +453,24 @@ static void tts_handle_speech_stream(const tts_backend &      be,
         },
         [st](bool) {
             st->client_gone.store(true, std::memory_order_release);
+            // Join before reading rc: the worker writes the final status
+            // under st->mu, so reading first would log the default 0 for a
+            // cancel that lands during the join. st->mu stays unlocked
+            // while waiting, or the worker could never publish rc.
             if (st->th.joinable()) {
                 st->th.join();
             }
+            std::lock_guard<std::mutex> lk(st->mu);
+            const std::string           voice  = st->voice;
+            const size_t                text   = st->text_len;
+            const size_t                frames = st->frames;
+            const int                   rc     = st->rc;
+            const double                ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st->start).count();
+            // A cancel is a normal barge-in, not a server fault.
+            const bool ok = rc == 0 || rc == QT_STATUS_CANCELLED;
+            qt_log(ok ? QT_LOG_INFO : QT_LOG_WARN, "[Server] %s voice=%s text=%zu frames=%zu ms=%.0f status=%d", st->label,
+                   voice.empty() ? "-" : voice.c_str(), text, frames, ms, rc);
         });
 }
 
